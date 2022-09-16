@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 #[derive(Default, Debug)]
+#[allow(dead_code)]
 struct ID3v2HeaderFlags {
     has_extended_header: bool,
     has_unsynchronization: bool,
@@ -11,6 +12,7 @@ struct ID3v2HeaderFlags {
 }
 
 #[derive(Default, Debug)]
+#[allow(dead_code)]
 pub struct ID3v2Header {
     flags: ID3v2HeaderFlags,
     size: u32,
