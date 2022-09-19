@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use utils::log;
 
-use colored::*;
-use mp3_file::{is_string_known_id3v2_id, is_string_valid_id3v2_id, Mp3File};
+use mp3_file::{is_string_known_id3v2_id, is_string_valid_id3v2_id, Mp3File, KNOWN_ID3V2_IDS};
 
 mod mp3_file;
 mod utils;
@@ -55,75 +55,70 @@ enum Command {
         #[clap(value_parser, short, long, help = "The ID of the frame to delete")]
         frame_index: Option<u32>,
     },
+    ShowKnownFrameIds {},
 }
 
-fn main() -> () {
+fn main() -> Result<(), ()> {
+    log::init(None);
     let args = Args::parse();
     match args.command {
-        Command::Read { file, frame_flags } => {
-            let mut mp3_file = Mp3File::from_path(&file);
-            mp3_file.read();
-            // Unwrap used because this literally should never panic
+        Command::Read {
+            file: file_path,
+            frame_flags,
+        } => {
+            let mp3_file = Mp3File::from_path(&file_path)?;
             println!(
                 "{}",
                 mp3_file.format_frames(frame_flags, args.human_readable)
             );
         }
         Command::Write {
-            file,
+            file: file_path,
             data,
             frame_id,
         } => {
             if !validate_frame_id(&frame_id) {
-                return ();
+                return Err(());
             }
-            let mut write_temp_path = file.clone();
-            write_temp_path.set_extension(".mp3.temp");
-
-            let mut mp3_file = Mp3File::from_path(&file);
-            mp3_file.read();
+            let mut mp3_file = Mp3File::from_path(&file_path)?;
             mp3_file.add_frame(frame_id, data);
-            mp3_file.write_to_file(&write_temp_path);
+            mp3_file.write_to_file(&file_path)?;
         }
         Command::Edit {
-            file,
+            file: file_path,
             frame_id,
             data,
             frame_index,
         } => {
             let unwraped_frame_index = frame_index.unwrap_or(1);
             if !validate_frame_id(&frame_id) || !validate_frame_index(unwraped_frame_index) {
-                return ();
+                return Err(());
             }
             let zero_indexed_frame = unwraped_frame_index - 1;
-            let mut write_temp_path = file.clone();
-            write_temp_path.set_extension(".mp3.temp");
 
-            let mut mp3_file = Mp3File::from_path(&file);
-            mp3_file.read();
+            let mut mp3_file = Mp3File::from_path(&file_path)?;
 
-            match mp3_file.edit_frame(&frame_id, data, zero_indexed_frame) {
-                Ok(_) => (),
-                Err(largest_found_index) => {
+            mp3_file
+                .edit_frame(&frame_id, data, zero_indexed_frame)
+                .or_else(|largest_found_index| {
                     error_no_frame_with_id_found(
                         &frame_id,
                         unwraped_frame_index,
                         largest_found_index,
                     );
-                    return ();
-                }
-            };
+                    Err(())
+                })?;
 
-            mp3_file.write_to_file(&write_temp_path);
+            mp3_file.write_to_file(&file_path)?;
         }
         Command::Delete {
-            file,
+            file: file_path,
             frame_index,
             frame_id,
         } => {
             let unwraped_frame_index = frame_index.unwrap_or(1);
             if !validate_frame_id(&frame_id) || !validate_frame_index(unwraped_frame_index) {
-                return ();
+                return Ok(());
             }
             let zero_indexed_frame = unwraped_frame_index - 1;
             println!(
@@ -132,11 +127,7 @@ fn main() -> () {
                 ordinal_numeral(unwraped_frame_index),
                 frame_id
             );
-            let mut write_temp_path = file.clone();
-            write_temp_path.set_extension("mp3.temp");
-
-            let mut mp3_file = Mp3File::from_path(&file);
-            mp3_file.read();
+            let mut mp3_file = Mp3File::from_path(&file_path)?;
             match mp3_file.remove_frame(&frame_id, zero_indexed_frame) {
                 Ok(_) => (),
                 Err(largest_found_index) => {
@@ -145,32 +136,32 @@ fn main() -> () {
                         zero_indexed_frame,
                         largest_found_index,
                     );
-                    return ();
+                    return Ok(());
                 }
             }
-            mp3_file.write_to_file(&write_temp_path);
+            mp3_file.write_to_file(&file_path)?;
         }
-    }
+        Command::ShowKnownFrameIds {} => {
+            for (id, description) in KNOWN_ID3V2_IDS.iter() {
+                println!("{} - {}", id, description);
+            }
+        }
+    };
+    Ok(())
 }
 
 fn ordinal_numeral(number: u32) -> &'static str {
-    if number == 1 {
-        "st"
-    } else if number == 2 {
-        "nd"
-    } else if number == 3 {
-        "rd"
-    } else {
-        "th"
+    match number {
+        1 => "st",
+        2 => "nd",
+        3 => "rd",
+        _ => "th",
     }
 }
 
 fn validate_frame_index(frame_index: u32) -> bool {
     if frame_index == 0 {
-        println!(
-            "{}",
-            "Error: The frame index starts at one, not zero.".red()
-        );
+        log::error("The frame index starts at one, not zero.".to_string());
         false
     } else {
         true
@@ -179,53 +170,38 @@ fn validate_frame_index(frame_index: u32) -> bool {
 
 fn error_no_frame_with_id_found(frame_id: &str, index: u32, largest_found_index: u32) {
     if largest_found_index == 0 {
-        println!(
-            "{}{}{}",
-            "Error: No frame found with id \"".red(),
-            frame_id.red(),
-            "\"".red()
-        );
+        log::error(format!("Error: No frame found with id \"{}\"", frame_id,));
     } else if largest_found_index == 1 {
-        println!(
-            "{}{}{}{}{}",
-            "Error: There is only 1 frame with id \"".red(),
-            frame_id.red(),
-            "\". You tried to remove the ".red(),
-            index.to_string().red(),
-            ordinal_numeral(index).red()
-        )
+        log::error(format!(
+            "There is only 1 frame with id \"{}\". You tried to remove the {}{}",
+            frame_id,
+            index,
+            ordinal_numeral(index)
+        ))
     } else {
-        println!(
-            "{}{}{}{}{}{}{}",
-            "Error: There are only ".red(),
-            largest_found_index.to_string().red(),
-            " frames with id \"".red(),
-            frame_id.red(),
-            "\". You tried to remove the ".red(),
-            index.to_string().red(),
-            ordinal_numeral(index).red()
-        )
+        log::error(format!(
+            "There are only {} frames with id \"{}\". You tried to remove the {}{}",
+            largest_found_index.to_string(),
+            frame_id,
+            index,
+            ordinal_numeral(index)
+        ))
     }
 }
 
 fn validate_frame_id(frame_id: &str) -> bool {
     if !is_string_valid_id3v2_id(&frame_id) {
-        println!(
-            "{}{}{}",
-            "Error: Provided frame id \"".red(),
-            frame_id.red(),
-            "\" is not valid. It must be a four-character word composed exclusively of numbers or uppercase letters".red()
-        );
+        log::error(format!(
+            "Provided frame id \"{}\" is not valid. It must be a four-character word composed exclusively of numbers or uppercase letters",
+            frame_id,
+        ));
         return false;
     }
     if !is_string_known_id3v2_id(&frame_id) {
-        println!(
-            "{}{}{}",
-            "Warning: Provided frame id \"".yellow(),
-            frame_id.yellow(),
-            "\" is not a known id. The operation will still be executed.".yellow()
-        );
-        return false;
+        log::warn(format!(
+            "Provided frame id \"{}\" is not a known id. The operation will still be executed.",
+            frame_id,
+        ));
     }
     true
 }

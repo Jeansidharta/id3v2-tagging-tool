@@ -10,4 +10,5 @@ authors = ["Jean Sidharta <jeansidhara@gmail.com>"]
 [dependencies]
 clap = { version = "3.2.20", features = ["derive"] }
 colored = "2"
+log = "0.4.17"
 

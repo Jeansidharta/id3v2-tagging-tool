@@ -1,6 +1,8 @@
-use crate::utils::{check_bit, read_syncsafe_intefer, write_syncsafe_integer};
+use crate::utils::{
+    check_bit, is_valid_syncsafe_integer, log, read_syncsafe_integer, write_syncsafe_integer,
+};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 
 #[derive(Debug)]
 struct ID3v2FrameFlags {
@@ -86,30 +88,81 @@ impl ID3v2Frame {
             },
         }
     }
-    pub fn from_read_file(file: &mut File) -> ID3v2Frame {
+    pub fn from_read_file(file: &mut File) -> Result<ID3v2Frame, ()> {
         let mut buffer = [0u8; 10];
-        file.read_exact(&mut buffer).expect("Failed to read buffer");
-        let id = String::from_utf8(buffer[0..4].to_vec()).unwrap();
-        let size = read_syncsafe_intefer(&buffer[4..8].try_into().unwrap());
-        let flags = &buffer[8..10];
+        file.read_exact(&mut buffer).or_else(|error| {
+            match error.kind() {
+                ErrorKind::UnexpectedEof => {
+                    log::error("Failed to read frame header. File ended too soon.".to_string())
+                }
+                _ => log::error("Failed to read frame header. Unknown error.".to_string()),
+            };
+            Err(())
+        })?;
+        let id = std::str::from_utf8(&buffer[0..4])
+            .or_else(|_| {
+                log::error(
+                    "Failed to transform frame ID to UTF8 string. Invalid string.".to_string(),
+                );
+                Err(())
+            })?
+            .to_string();
+
+        if !is_string_valid_id3v2_id(&id) {
+            log::warn(format!(
+                "{}{}{}",
+                "Frame id \"", id, "\" is not a valid frame id."
+            ));
+        } else if !is_string_known_id3v2_id(&id) {
+            log::warn(format!(
+                "{}{}{}",
+                "Frame id \"", id, "\" is valid, but not a known frame id."
+            ));
+        };
+        let size = {
+            let size_bytes: [u8; 4] = buffer[4..8].try_into().unwrap();
+            if !is_valid_syncsafe_integer(&size_bytes) {
+                log::warn(
+                    "Frame size is not properly represented as a syncsafe integer".to_string(),
+                );
+            }
+            read_syncsafe_integer(&size_bytes)
+        };
+        let flags = {
+            let flags_bytes: [u8; 2] = buffer[8..10].try_into().unwrap();
+            if (flags_bytes[0] | flags_bytes[1]) << 3 != 0 {
+                log::warn("Frame has unofficial flag bits set".to_string());
+            }
+            ID3v2FrameFlags {
+                tag_alter_preservation: check_bit(flags_bytes[0], 7),
+                file_alter_preservation: check_bit(flags_bytes[0], 6),
+                read_only: check_bit(flags_bytes[0], 5),
+                compression: check_bit(flags_bytes[1], 7),
+                encryption: check_bit(flags_bytes[1], 6),
+                grouping_identity: check_bit(flags_bytes[1], 5),
+                raw_flags_byte: flags_bytes,
+            }
+        };
         let mut data_buffer = vec![0u8; size.try_into().unwrap()];
-        file.read_exact(&mut data_buffer)
-            .expect("Could not read entire contents of frame");
-        let data = String::from_utf8(data_buffer).unwrap();
-        ID3v2Frame {
-            flags: ID3v2FrameFlags {
-                tag_alter_preservation: check_bit(flags[0], 7),
-                file_alter_preservation: check_bit(flags[0], 6),
-                read_only: check_bit(flags[0], 5),
-                compression: check_bit(flags[1], 7),
-                encryption: check_bit(flags[1], 6),
-                grouping_identity: check_bit(flags[1], 5),
-                raw_flags_byte: flags.try_into().unwrap(),
-            },
+        file.read_exact(&mut data_buffer).or_else(|err| {
+            match err.kind() {
+                ErrorKind::UnexpectedEof => {
+                    log::error("Failed to read frame data. File ended too soon.".to_string())
+                }
+                _ => log::error("Failed to read frame data. Unknown error.".to_string()),
+            };
+            Err(())
+        })?;
+        let data = String::from_utf8(data_buffer).or_else(|_| {
+            log::error("Failed to convert frame data to UTF-8 string.".to_string());
+            Err(())
+        })?;
+        Ok(ID3v2Frame {
+            flags,
             size,
             id,
             data,
-        }
+        })
     }
 
     pub fn format_id(&self) -> String {
@@ -118,6 +171,27 @@ impl ID3v2Frame {
 
     pub fn format_data(&self) -> String {
         format!("{}", self.data)
+    }
+
+    pub fn is_valid_frame_header(bytes: &[char; 4]) -> bool {
+        ((bytes[0] >= 'A' && bytes[0] <= 'Z') || (bytes[0] >= '0' && bytes[0] <= '9'))
+            && ((bytes[1] >= 'A' && bytes[1] <= 'Z') || (bytes[1] >= '0' && bytes[1] <= '9'))
+            && ((bytes[2] >= 'A' && bytes[2] <= 'Z') || (bytes[2] >= '0' && bytes[2] <= '9'))
+            && ((bytes[3] >= 'A' && bytes[3] <= 'Z') || (bytes[3] >= '0' && bytes[3] <= '9'))
+    }
+
+    pub fn has_new_frame(read_file: &mut File) -> bool {
+        let mut buffer = [0u8; 4];
+        read_file
+            .read_exact(&mut buffer)
+            .expect("Failed to read file");
+        if let Err(_e) = read_file.seek(SeekFrom::Current(-4)) {
+            false
+        } else if !Self::is_valid_frame_header(&mut buffer.map(|x| x as char)) {
+            false
+        } else {
+            true
+        }
     }
 
     pub fn format_flags(&self, human_readable: bool) -> String {
@@ -179,7 +253,7 @@ impl ID3v2Frame {
             .collect()
         }
     }
-    pub fn write_to_file(&self, file: &mut File) {
+    pub fn write_to_file(&self, file: &mut File) -> Result<(), ()> {
         let mut id_chars = self.id.chars();
         let id_buffer: Vec<u8> = [
             id_chars.next(),
@@ -192,11 +266,18 @@ impl ID3v2Frame {
         .collect();
 
         let size_buffer = write_syncsafe_integer(self.size);
-        let err_message = "Failed to write frame to fileA";
-        file.write(&id_buffer).expect(err_message);
-        file.write(&size_buffer).expect(err_message);
-        file.write(&self.flags.raw_flags_byte).expect(err_message);
-        file.write(&self.data.as_bytes()).expect(err_message);
+        file.write(&id_buffer)
+            .and_then(|_| file.write(&size_buffer))
+            .and_then(|_| file.write(&self.flags.raw_flags_byte))
+            .and_then(|_| file.write(&self.data.as_bytes()))
+            .or_else(|error| {
+                log::error(format!(
+                    "Failed to write to file. Uknown error. Error kind is {}",
+                    error.kind()
+                ));
+                Err(())
+            })?;
+        Ok(())
     }
 }
 
@@ -222,7 +303,7 @@ pub fn is_string_known_id3v2_id(value: &str) -> bool {
     }
 }
 
-const KNOWN_ID3V2_IDS: [(&str, &str); 92] = [
+pub const KNOWN_ID3V2_IDS: [(&str, &str); 92] = [
     ("AENC", "Audio encryption"),
     ("ASPI", "Audio seek point index (v4 only)"),
     ("APIC", "Attached picture"),
