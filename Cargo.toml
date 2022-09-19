@@ -11,4 +11,5 @@ authors = ["Jean Sidharta <jeansidhara@gmail.com>"]
 clap = { version = "3.2.20", features = ["derive"] }
 colored = "2"
 log = "0.4.17"
+encoding = "0.2"
 

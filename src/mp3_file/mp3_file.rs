@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
 
 use super::{id3v2_frame::ID3v2Frame, id3v2_header::ID3v2Header};
@@ -29,7 +29,7 @@ impl Mp3File {
     ) -> Result<(), u32> {
         self.find_index_of_frame_with_id(frame_id, user_frame_index)
             .and_then(|index| {
-                self.frames[index].data = new_data;
+                self.frames[index].edit_data(new_data);
                 Ok(())
             })
     }
@@ -135,7 +135,8 @@ impl Mp3File {
                 .write(&buffer)
                 .expect("Failed to write to file chunk");
         }
-
+        fs::rename(write_file_path, read_file_path)
+            .expect("Failed to rename temp file to actual file.");
         Ok(())
     }
 

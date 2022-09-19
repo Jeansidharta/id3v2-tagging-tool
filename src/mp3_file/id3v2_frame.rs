@@ -1,8 +1,17 @@
-use crate::utils::{
-    check_bit, is_valid_syncsafe_integer, log, read_syncsafe_integer, write_syncsafe_integer,
-};
+use crate::utils::{check_bit, latin1, log, read_be_integer, write_be_integer};
 use std::fs::File;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+
+enum Endianess {
+    BigEndian,
+    LittleEndian,
+}
+
+#[derive(Debug)]
+enum Encoding {
+    Latin1,
+    UTF16(Endianess),
+}
 
 #[derive(Debug)]
 struct ID3v2FrameFlags {
@@ -69,6 +78,7 @@ pub struct ID3v2Frame {
     pub size: u32,
     pub id: String,
     pub data: String,
+    encoding: Encoding,
 }
 
 impl ID3v2Frame {
@@ -77,6 +87,7 @@ impl ID3v2Frame {
             size: data.len() as u32,
             id,
             data,
+            encoding: Encoding::Latin1,
             flags: ID3v2FrameFlags {
                 tag_alter_preservation: false,
                 file_alter_preservation: false,
@@ -121,12 +132,7 @@ impl ID3v2Frame {
         };
         let size = {
             let size_bytes: [u8; 4] = buffer[4..8].try_into().unwrap();
-            if !is_valid_syncsafe_integer(&size_bytes) {
-                log::warn(
-                    "Frame size is not properly represented as a syncsafe integer".to_string(),
-                );
-            }
-            read_syncsafe_integer(&size_bytes)
+            read_be_integer(&size_bytes)
         };
         let flags = {
             let flags_bytes: [u8; 2] = buffer[8..10].try_into().unwrap();
@@ -143,7 +149,7 @@ impl ID3v2Frame {
                 raw_flags_byte: flags_bytes,
             }
         };
-        let mut data_buffer = vec![0u8; size.try_into().unwrap()];
+        let mut raw_data_buffer = vec![0u8; size.try_into().unwrap()];
         file.read_exact(&mut data_buffer).or_else(|err| {
             match err.kind() {
                 ErrorKind::UnexpectedEof => {
@@ -153,12 +159,38 @@ impl ID3v2Frame {
             };
             Err(())
         })?;
+
+        let data_buffer = raw_data_buffer.clone();
+
+        let encoding = {
+            let data = data_buffer;
+            // Look for a Byte Order Mark (BOM)
+            if data[0] == 0xFE && data[1] == 0xFF {
+                Encoding::UTF16(Endianess::BigEndian)
+            } else if data[0] == 0xFF && data[1] == 0xFE {
+                Encoding::UTF16(Endianess::LittleEndian)
+            } else if !latin1::is_valid_latin1_string(&data) {
+                log::warn(format!("Data for frame with ID {} is not a valid ISO-8859-1 string, and does not have a Byte Order Mark, so it's also not a valid UTF-16. Will treat as a ISO-8859-1 anyways.", id));
+                Encoding::Latin1
+            } else {
+                Encoding::Latin1
+            }
+        };
+
+        let data = match encoding {
+            Encoding::Latin1 => latin1::decode(&data_buffer),
+            Encoding::UTF16(Endianess::BigEndian) => String::
+            _ => return Err(()),
+        };
+
         let data = String::from_utf8(data_buffer).or_else(|_| {
             log::error("Failed to convert frame data to UTF-8 string.".to_string());
             Err(())
         })?;
+
         Ok(ID3v2Frame {
             flags,
+            encoding,
             size,
             id,
             data,
@@ -253,6 +285,26 @@ impl ID3v2Frame {
             .collect()
         }
     }
+    fn get_data_as_utf16(&self) -> Vec<u8> {
+        let mut bytes = self
+            .data
+            .encode_utf16()
+            .map(|char| char.to_be_bytes())
+            .flatten()
+            .collect::<Vec<u8>>();
+
+        // String
+        bytes.insert(0, 0xFE);
+        bytes.insert(0, 0xFF);
+        bytes.insert(0, 0x00);
+        bytes.insert(0, 0x00);
+        bytes.push(00);
+        bytes.push(00);
+        bytes
+    }
+
+    fn get_data_as_latin1(&self) -> Vec<u8> {}
+
     pub fn write_to_file(&self, file: &mut File) -> Result<(), ()> {
         let mut id_chars = self.id.chars();
         let id_buffer: Vec<u8> = [
@@ -265,11 +317,27 @@ impl ID3v2Frame {
         .map(|option| option.expect("Failed to extract ID3v2 ID from frame") as u8)
         .collect();
 
-        let size_buffer = write_syncsafe_integer(self.size);
+        let size_buffer = write_be_integer(self.size);
         file.write(&id_buffer)
             .and_then(|_| file.write(&size_buffer))
             .and_then(|_| file.write(&self.flags.raw_flags_byte))
-            .and_then(|_| file.write(&self.data.as_bytes()))
+            .and_then(|_| {
+                let mut bytes = self
+                    .data
+                    .encode_utf16()
+                    .map(|char| char.to_be_bytes())
+                    .flatten()
+                    .collect::<Vec<u8>>();
+
+                // String
+                bytes.insert(0, 0xFE);
+                bytes.insert(0, 0xFF);
+                bytes.insert(0, 0x00);
+                bytes.insert(0, 0x00);
+                bytes.push(00);
+                bytes.push(00);
+                file.write(&bytes)
+            })
             .or_else(|error| {
                 log::error(format!(
                     "Failed to write to file. Uknown error. Error kind is {}",
@@ -278,6 +346,11 @@ impl ID3v2Frame {
                 Err(())
             })?;
         Ok(())
+    }
+
+    pub fn edit_data(&mut self, data: String) {
+        self.size = data.bytes().len() as u32;
+        self.data = data;
     }
 }
 
